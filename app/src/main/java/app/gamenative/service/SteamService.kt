@@ -556,14 +556,19 @@ class SteamService : Service(), IChallengeUrlChanged {
             val selfAccountId = selfId.accountID.toInt()
 
             val ownerSteamIds = linkedSetOf<Long>()
-            svc.familyAppOwnerSteamIds[appId]?.let { ownerSteamIds.addAll(it) }
+            val cachedOwners = svc.familyAppOwnerSteamIds[appId]
+            if (!cachedOwners.isNullOrEmpty()) {
+                ownerSteamIds.addAll(cachedOwners)
+            }
 
-            // Load licenses once; reuse for owner discovery, package lookup, and DLC counts.
+            // Load licenses once; reuse for owner discovery (fallback), package lookup, and DLC counts.
             val allLicenses = svc.licenseDao.getAllLicenses()
             val licensesForApp = allLicenses.filter { appId in it.appIds }
-            for (license in licensesForApp) {
-                for (accountId in license.ownerAccountId) {
-                    ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
+            if (ownerSteamIds.isEmpty()) {
+                for (license in licensesForApp) {
+                    for (accountId in license.ownerAccountId) {
+                        ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
+                    }
                 }
             }
 

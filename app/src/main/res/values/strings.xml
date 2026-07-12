@@ -86,7 +86,9 @@
     <string name="shared_from_name">Shared from %1$s</string>
     <string name="preferred_copy_your_label">Your copy (%1$s)</string>
     <string name="preferred_copy_family_label">%1$s</string>
+    <string name="preferred_copy_family_member">Family member</string>
     <string name="preferred_copy_dlc_count">%1$d DLC</string>
+    <string name="preferred_copy_label_with_dlc">%1$s · %2$s</string>
     <string name="preferred_copy_failed">Could not change preferred copy. Try again while connected to Steam.</string>
     <string name="preferred_copy_confirm">Use this copy</string>
     <string name="private_branch_password_hint">Enter access code</string>

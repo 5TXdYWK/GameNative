@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -1003,7 +1004,10 @@ internal fun AppScreenContent(
                                 text = stringResource(R.string.change_preferred_copy),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.clickable(onClick = onChangePreferredCopy),
+                                modifier = Modifier.clickable(
+                                    role = Role.Button,
+                                    onClick = onChangePreferredCopy,
+                                ),
                             )
                         }
                     }

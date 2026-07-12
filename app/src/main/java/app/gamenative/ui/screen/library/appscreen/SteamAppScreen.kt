@@ -43,6 +43,7 @@ import app.gamenative.PluviaApp
 import app.gamenative.R
 import app.gamenative.data.GameSource
 import app.gamenative.data.LibraryItem
+import app.gamenative.data.PreferredCopyOption
 import app.gamenative.enums.Marker
 import app.gamenative.enums.PathType
 import app.gamenative.enums.SyncResult
@@ -373,16 +374,24 @@ class SteamAppScreen : BaseAppScreen() {
             }
         }
 
-        val showChangePreferredCopy = remember(gameId, preferredCopyRefresh) {
-            SteamService.hasMultiplePreferredCopyOptions(gameId)
-        }
-        val preferredCopyStatusText = remember(gameId, preferredCopyRefresh, showChangePreferredCopy) {
-            if (!showChangePreferredCopy) return@remember null
-            val active = SteamService.getActivePreferredCopy(gameId) ?: return@remember null
-            if (active.isSelf) {
+        var showChangePreferredCopy by remember(gameId) { mutableStateOf(false) }
+        var preferredCopyStatusText by remember(gameId) { mutableStateOf<String?>(null) }
+        LaunchedEffect(gameId, preferredCopyRefresh) {
+            val options = withContext(Dispatchers.IO) {
+                SteamService.getPreferredCopyOptions(gameId)
+            }
+            val hasMultiple = options.size >= 2
+            showChangePreferredCopy = hasMultiple
+            val active = SteamService.selectActivePreferredCopy(gameId, options)
+            preferredCopyStatusText = if (!hasMultiple || active == null) {
+                null
+            } else if (active.isSelf) {
                 context.getString(R.string.using_your_copy)
             } else {
-                context.getString(R.string.shared_from_name, active.displayName)
+                val name = active.displayName.ifBlank {
+                    context.getString(R.string.preferred_copy_family_member)
+                }
+                context.getString(R.string.shared_from_name, name)
             }
         }
 
@@ -410,9 +419,8 @@ class SteamAppScreen : BaseAppScreen() {
         context: Context,
         libraryItem: LibraryItem,
     ): (() -> Unit)? {
-        val gameId = libraryItem.gameId
-        if (!SteamService.hasMultiplePreferredCopyOptions(gameId)) return null
-        return { showPreferredCopyDialog(gameId) }
+        // Visibility is gated by GameDisplayInfo.showChangePreferredCopy (loaded async).
+        return { showPreferredCopyDialog(libraryItem.gameId) }
     }
 
     override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean {
@@ -761,6 +769,12 @@ class SteamAppScreen : BaseAppScreen() {
         val appInfo = SteamService.getAppInfoOf(gameId) ?: return emptyList()
         val isDownloadInProgress = SteamService.getDownloadingAppInfoOf(gameId) != null
         val scope = rememberCoroutineScope()
+        var showPreferredCopyMenuOption by remember(gameId) { mutableStateOf(false) }
+        LaunchedEffect(gameId) {
+            showPreferredCopyMenuOption = withContext(Dispatchers.IO) {
+                SteamService.hasMultiplePreferredCopyOptions(gameId)
+            }
+        }
 
         val options = mutableListOf<AppMenuOption>(
             AppMenuOption(
@@ -853,7 +867,7 @@ class SteamAppScreen : BaseAppScreen() {
             ),
         )
 
-        if (SteamService.hasMultiplePreferredCopyOptions(gameId)) {
+        if (showPreferredCopyMenuOption) {
             options += AppMenuOption(
                 AppOptionMenuType.ChangePreferredCopy,
                 onClick = { showPreferredCopyDialog(gameId) },
@@ -1586,25 +1600,38 @@ class SteamAppScreen : BaseAppScreen() {
         }
 
         if (showPreferredCopyDialogState) {
-            val options = remember(gameId) { SteamService.getPreferredCopyOptions(gameId) }
-            val current = remember(gameId) { SteamService.getActivePreferredCopy(gameId) }
+            var options by remember(gameId) { mutableStateOf<List<PreferredCopyOption>>(emptyList()) }
+            var current by remember(gameId) { mutableStateOf<PreferredCopyOption?>(null) }
             val scope = rememberCoroutineScope()
-            SteamPreferredCopyDialog(
-                options = options,
-                currentLenderSteamId = current?.lenderSteamId,
-                onConfirm = { lenderSteamId ->
+            LaunchedEffect(gameId) {
+                val loaded = withContext(Dispatchers.IO) {
+                    SteamService.getPreferredCopyOptions(gameId)
+                }
+                if (loaded.isEmpty()) {
                     hidePreferredCopyDialog(gameId)
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            SteamService.setPreferredCopy(gameId, lenderSteamId)
+                    return@LaunchedEffect
+                }
+                options = loaded
+                current = SteamService.selectActivePreferredCopy(gameId, loaded)
+            }
+            if (options.isNotEmpty()) {
+                SteamPreferredCopyDialog(
+                    options = options,
+                    currentLenderSteamId = current?.lenderSteamId,
+                    onConfirm = { lenderSteamId ->
+                        hidePreferredCopyDialog(gameId)
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) {
+                                SteamService.setPreferredCopy(gameId, lenderSteamId)
+                            }
+                            if (!ok) {
+                                SnackbarManager.show(context.getString(R.string.preferred_copy_failed))
+                            }
                         }
-                        if (!ok) {
-                            SnackbarManager.show(context.getString(R.string.preferred_copy_failed))
-                        }
-                    }
-                },
-                onDismissRequest = { hidePreferredCopyDialog(gameId) },
-            )
+                    },
+                    onDismissRequest = { hidePreferredCopyDialog(gameId) },
+                )
+            }
         }
     }
 }
@@ -1733,7 +1760,7 @@ private fun SteamChangeBranchDialog(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SteamPreferredCopyDialog(
-    options: List<app.gamenative.data.PreferredCopyOption>,
+    options: List<PreferredCopyOption>,
     currentLenderSteamId: Long?,
     onConfirm: (lenderSteamId: Long) -> Unit,
     onDismissRequest: () -> Unit,
@@ -1763,18 +1790,7 @@ private fun SteamPreferredCopyDialog(
                     expanded = expanded,
                     onExpandedChange = { expanded = it },
                 ) {
-                    val label = selectedOption?.let { option ->
-                        val base = if (option.isSelf) {
-                            stringResource(R.string.preferred_copy_your_label, option.displayName)
-                        } else {
-                            stringResource(R.string.preferred_copy_family_label, option.displayName)
-                        }
-                        if (option.ownedDlcCount != null) {
-                            "$base · ${stringResource(R.string.preferred_copy_dlc_count, option.ownedDlcCount)}"
-                        } else {
-                            base
-                        }
-                    }.orEmpty()
+                    val label = selectedOption?.let { preferredCopyOptionLabel(it) }.orEmpty()
                     NoExtractOutlinedTextField(
                         value = label,
                         onValueChange = {},
@@ -1790,16 +1806,7 @@ private fun SteamPreferredCopyDialog(
                         onDismissRequest = { expanded = false },
                     ) {
                         options.forEach { option ->
-                            val itemLabel = if (option.isSelf) {
-                                stringResource(R.string.preferred_copy_your_label, option.displayName)
-                            } else {
-                                stringResource(R.string.preferred_copy_family_label, option.displayName)
-                            }
-                            val withDlc = if (option.ownedDlcCount != null) {
-                                "$itemLabel · ${stringResource(R.string.preferred_copy_dlc_count, option.ownedDlcCount)}"
-                            } else {
-                                itemLabel
-                            }
+                            val withDlc = preferredCopyOptionLabel(option)
                             DropdownMenuItem(
                                 text = { Text(withDlc) },
                                 onClick = {
@@ -1826,6 +1833,31 @@ private fun SteamPreferredCopyDialog(
             }
         },
     )
+}
+
+@Composable
+private fun preferredCopyOptionLabel(option: PreferredCopyOption): String {
+    val displayName = option.displayName.ifBlank {
+        if (option.isSelf) {
+            stringResource(R.string.default_user_name)
+        } else {
+            stringResource(R.string.preferred_copy_family_member)
+        }
+    }
+    val base = if (option.isSelf) {
+        stringResource(R.string.preferred_copy_your_label, displayName)
+    } else {
+        stringResource(R.string.preferred_copy_family_label, displayName)
+    }
+    return if (option.ownedDlcCount != null) {
+        stringResource(
+            R.string.preferred_copy_label_with_dlc,
+            base,
+            stringResource(R.string.preferred_copy_dlc_count, option.ownedDlcCount),
+        )
+    } else {
+        base
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

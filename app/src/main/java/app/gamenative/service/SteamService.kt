@@ -546,22 +546,22 @@ class SteamService : Service(), IChallengeUrlChanged {
         val familyGroupId: Long
             get() = instance?.familyGroupId ?: 0L
 
-        fun hasMultiplePreferredCopyOptions(appId: Int): Boolean =
+        suspend fun hasMultiplePreferredCopyOptions(appId: Int): Boolean =
             getPreferredCopyOptions(appId).size >= 2
 
-        fun getPreferredCopyOptions(appId: Int): List<PreferredCopyOption> {
-            val svc = instance ?: return emptyList()
-            val selfSteamId = userSteamId?.convertToUInt64() ?: return emptyList()
-            val selfAccountId = userSteamId!!.accountID.toInt()
+        suspend fun getPreferredCopyOptions(appId: Int): List<PreferredCopyOption> = withContext(Dispatchers.IO) {
+            val svc = instance ?: return@withContext emptyList()
+            val selfId = userSteamId ?: return@withContext emptyList()
+            val selfSteamId = selfId.convertToUInt64()
+            val selfAccountId = selfId.accountID.toInt()
 
             val ownerSteamIds = linkedSetOf<Long>()
             svc.familyAppOwnerSteamIds[appId]?.let { ownerSteamIds.addAll(it) }
 
-            // Also include owners from local licenses that grant this app.
-            val licenses = runBlocking(Dispatchers.IO) {
-                svc.licenseDao.getAllLicenses().filter { appId in it.appIds }
-            }
-            for (license in licenses) {
+            // Load licenses once; reuse for owner discovery, package lookup, and DLC counts.
+            val allLicenses = svc.licenseDao.getAllLicenses()
+            val licensesForApp = allLicenses.filter { appId in it.appIds }
+            for (license in licensesForApp) {
                 for (accountId in license.ownerAccountId) {
                     ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
                 }
@@ -574,19 +574,18 @@ class SteamService : Service(), IChallengeUrlChanged {
                 }
             }
 
-            if (ownerSteamIds.isEmpty()) return emptyList()
+            if (ownerSteamIds.isEmpty()) return@withContext emptyList()
 
-            return ownerSteamIds.map { steamId64 ->
+            val dlcApps = svc.appDao.findDownloadableDLCApps(appId).orEmpty() +
+                svc.appDao.findHiddenDLCApps(appId).orEmpty()
+
+            ownerSteamIds.map { steamId64 ->
                 val steamId = SteamID(steamId64)
                 val accountId = steamId.accountID.toInt()
                 val isSelf = steamId64 == selfSteamId || accountId == selfAccountId
-                val packageId = runBlocking(Dispatchers.IO) {
-                    findLicenseForLender(appId, accountId)?.packageId
-                }
+                val packageId = findLicenseForLender(licensesForApp, accountId)?.packageId
                 val dlcCount = if (packageId != null) {
-                    runBlocking(Dispatchers.IO) {
-                        countDlcForLender(appId, accountId)
-                    }
+                    countDlcForLender(allLicenses, accountId, dlcApps)
                 } else {
                     null
                 }
@@ -594,10 +593,9 @@ class SteamService : Service(), IChallengeUrlChanged {
                     lenderSteamId = steamId64,
                     accountId = accountId,
                     displayName = if (isSelf) {
-                        PrefManager.steamUserName.ifBlank { "Your copy" }
+                        PrefManager.steamUserName
                     } else {
-                        svc.familyMemberNames[steamId64]
-                            ?: "Family member"
+                        svc.familyMemberNames[steamId64].orEmpty()
                     },
                     isSelf = isSelf,
                     packageId = packageId,
@@ -606,8 +604,13 @@ class SteamService : Service(), IChallengeUrlChanged {
             }.sortedWith(compareByDescending<PreferredCopyOption> { it.isSelf }.thenBy { it.displayName })
         }
 
-        fun getActivePreferredCopy(appId: Int): PreferredCopyOption? {
-            val options = getPreferredCopyOptions(appId)
+        suspend fun getActivePreferredCopy(appId: Int): PreferredCopyOption? =
+            selectActivePreferredCopy(appId, getPreferredCopyOptions(appId))
+
+        fun selectActivePreferredCopy(
+            appId: Int,
+            options: List<PreferredCopyOption>,
+        ): PreferredCopyOption? {
             if (options.isEmpty()) return null
             val preferredSteamId = instance?.preferredLenderByAppId?.get(appId)
                 ?: PrefManager.preferredFamilyLenders[appId]
@@ -653,9 +656,11 @@ class SteamService : Service(), IChallengeUrlChanged {
             true
         }
 
-        private suspend fun findLicenseForLender(appId: Int, lenderAccountId: Int): SteamLicense? {
-            val svc = instance ?: return null
-            val licenses = svc.licenseDao.getAllLicenses().filter { appId in it.appIds && lenderAccountId in it.ownerAccountId }
+        private fun findLicenseForLender(
+            licensesForApp: List<SteamLicense>,
+            lenderAccountId: Int,
+        ): SteamLicense? {
+            val licenses = licensesForApp.filter { lenderAccountId in it.ownerAccountId }
             if (licenses.isEmpty()) return null
             return licenses.maxByOrNull { license ->
                 when {
@@ -665,11 +670,12 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
         }
 
-        private suspend fun countDlcForLender(appId: Int, lenderAccountId: Int): Int {
-            val svc = instance ?: return 0
-            val licenses = svc.licenseDao.getAllLicenses().filter { lenderAccountId in it.ownerAccountId }
-            val dlcApps = svc.appDao.findDownloadableDLCApps(appId).orEmpty() +
-                svc.appDao.findHiddenDLCApps(appId).orEmpty()
+        private fun countDlcForLender(
+            allLicenses: List<SteamLicense>,
+            lenderAccountId: Int,
+            dlcApps: List<SteamApp>,
+        ): Int {
+            val licenses = allLicenses.filter { lenderAccountId in it.ownerAccountId }
             return dlcApps.count { dlc ->
                 licenses.any { dlc.id in it.appIds }
             }
@@ -678,7 +684,8 @@ class SteamService : Service(), IChallengeUrlChanged {
         private suspend fun applyPreferredLenderLocally(appId: Int, lenderSteamId: Long) {
             val svc = instance ?: return
             val lenderAccountId = SteamID(lenderSteamId).accountID.toInt()
-            val license = findLicenseForLender(appId, lenderAccountId)
+            val licensesForApp = svc.licenseDao.getAllLicenses().filter { appId in it.appIds }
+            val license = findLicenseForLender(licensesForApp, lenderAccountId)
             val app = svc.appDao.findApp(appId) ?: return
             if (license != null) {
                 svc.appDao.update(
@@ -3941,10 +3948,8 @@ class SteamService : Service(), IChallengeUrlChanged {
                         preferredLenderByAppId[appId] = lenderSteamId
                     }
                 }
-                // Overlay locally persisted preferences (user may have set while offline to Steam's cache).
-                PrefManager.preferredFamilyLenders.forEach { (appId, lender) ->
-                    preferredLenderByAppId[appId] = lender
-                }
+                // Persist server state locally so offline reconnect can fall back to it.
+                PrefManager.preferredFamilyLenders = preferredLenderByAppId.toMap()
                 Timber.i("Cached ${preferredLenderByAppId.size} preferred family lenders")
             } else {
                 Timber.w("GetPreferredLenders failed: ${preferredResult.result}")

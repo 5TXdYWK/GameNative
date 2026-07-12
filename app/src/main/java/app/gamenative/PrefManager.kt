@@ -1413,14 +1413,18 @@ object PrefManager {
      * Empty / missing entry means use the account's own copy when available.
      */
     private val PREFERRED_FAMILY_LENDERS_JSON = stringPreferencesKey("preferred_family_lenders_json")
+
+    private fun decodePreferredFamilyLenders(value: String): Map<Int, Long> =
+        runCatching {
+            Json.decodeFromString<Map<String, Long>>(value)
+                .mapNotNull { (key, lenderSteamId) ->
+                    key.toIntOrNull()?.let { appId -> appId to lenderSteamId }
+                }
+                .toMap()
+        }.getOrDefault(emptyMap())
+
     var preferredFamilyLenders: Map<Int, Long>
-        get() {
-            val value = getPref(PREFERRED_FAMILY_LENDERS_JSON, "{}")
-            return runCatching {
-                Json.decodeFromString<Map<String, Long>>(value)
-                    .mapKeys { it.key.toInt() }
-            }.getOrDefault(emptyMap())
-        }
+        get() = decodePreferredFamilyLenders(getPref(PREFERRED_FAMILY_LENDERS_JSON, "{}"))
         set(value) {
             if (value.isEmpty()) {
                 removePref(PREFERRED_FAMILY_LENDERS_JSON)
@@ -1433,12 +1437,22 @@ object PrefManager {
         }
 
     fun setPreferredFamilyLender(appId: Int, lenderSteamId: Long?) {
-        val updated = preferredFamilyLenders.toMutableMap()
-        if (lenderSteamId == null || lenderSteamId == 0L) {
-            updated.remove(appId)
-        } else {
-            updated[appId] = lenderSteamId
+        scope.launch {
+            dataStore.edit { pref ->
+                val current = decodePreferredFamilyLenders(pref[PREFERRED_FAMILY_LENDERS_JSON] ?: "{}")
+                val updated = current.toMutableMap()
+                if (lenderSteamId == null || lenderSteamId == 0L) {
+                    updated.remove(appId)
+                } else {
+                    updated[appId] = lenderSteamId
+                }
+                if (updated.isEmpty()) {
+                    pref.remove(PREFERRED_FAMILY_LENDERS_JSON)
+                } else {
+                    pref[PREFERRED_FAMILY_LENDERS_JSON] =
+                        Json.encodeToString(updated.mapKeys { it.key.toString() })
+                }
+            }
         }
-        preferredFamilyLenders = updated
     }
 }

@@ -570,6 +570,7 @@ internal fun AppScreenContent(
     onUpdateClick: () -> Unit,
     onBack: () -> Unit = {},
     optionsMenu: List<AppMenuOption>,
+    onChangePreferredCopy: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     // reactive — recomposes when network state changes
@@ -982,6 +983,28 @@ internal fun AppScreenContent(
                                     maxLines = 1,
                                 )
                             }
+                        }
+                    }
+
+                    if (displayInfo.showChangePreferredCopy && onChangePreferredCopy != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            displayInfo.preferredCopyStatusText?.let { status ->
+                                Text(
+                                    text = status,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.White.copy(alpha = 0.8f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                            }
+                            Text(
+                                text = stringResource(R.string.change_preferred_copy),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.clickable(onClick = onChangePreferredCopy),
+                            )
                         }
                     }
                     }

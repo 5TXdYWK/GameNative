@@ -104,6 +104,7 @@ object PrefManager {
                 pref.remove(STEAM_USER_NAME)
                 pref.remove(LAST_PICS_CHANGE_NUMBER)
                 pref.remove(STEAM_GAMES_COUNT)
+                pref.remove(PREFERRED_FAMILY_LENDERS_JSON)
             }
         }
     }
@@ -1406,4 +1407,38 @@ object PrefManager {
                 setPref(NEXUS_LAST_PLACEMENT_JSON, value)
             }
         }
+
+    /**
+     * Preferred Steam Families lender per appId (appId string → lender steamId64).
+     * Empty / missing entry means use the account's own copy when available.
+     */
+    private val PREFERRED_FAMILY_LENDERS_JSON = stringPreferencesKey("preferred_family_lenders_json")
+    var preferredFamilyLenders: Map<Int, Long>
+        get() {
+            val value = getPref(PREFERRED_FAMILY_LENDERS_JSON, "{}")
+            return runCatching {
+                Json.decodeFromString<Map<String, Long>>(value)
+                    .mapKeys { it.key.toInt() }
+            }.getOrDefault(emptyMap())
+        }
+        set(value) {
+            if (value.isEmpty()) {
+                removePref(PREFERRED_FAMILY_LENDERS_JSON)
+            } else {
+                setPref(
+                    PREFERRED_FAMILY_LENDERS_JSON,
+                    Json.encodeToString(value.mapKeys { it.key.toString() }),
+                )
+            }
+        }
+
+    fun setPreferredFamilyLender(appId: Int, lenderSteamId: Long?) {
+        val updated = preferredFamilyLenders.toMutableMap()
+        if (lenderSteamId == null || lenderSteamId == 0L) {
+            updated.remove(appId)
+        } else {
+            updated[appId] = lenderSteamId
+        }
+        preferredFamilyLenders = updated
+    }
 }

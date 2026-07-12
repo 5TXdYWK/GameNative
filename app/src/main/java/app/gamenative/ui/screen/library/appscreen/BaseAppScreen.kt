@@ -293,6 +293,15 @@ abstract class BaseAppScreen {
     }
 
     /**
+     * Optional handler for Steam Families "Change preferred copy" under Play.
+     * Return a click lambda when the game has multiple family copies.
+     */
+    protected open fun onChangePreferredCopyClick(
+        context: Context,
+        libraryItem: LibraryItem,
+    ): (() -> Unit)? = null
+
+    /**
      * Get the game display information for rendering the UI.
      * This is called to get all the data needed for the common UI layout.
      */
@@ -1359,6 +1368,7 @@ abstract class BaseAppScreen {
             },
             onBack = onBack,
             optionsMenu = optionsMenu,
+            onChangePreferredCopy = onChangePreferredCopyClick(context, libraryItem),
         )
 
         if (showReadiness && launchActivity != null) {

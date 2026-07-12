@@ -211,6 +211,18 @@ class SteamAppScreen : BaseAppScreen() {
 
         fun shouldShowBranchDialog(gameId: Int): Boolean = gameId in branchDialogVisibleIds
 
+        private val preferredCopyDialogVisibleIds = mutableStateListOf<Int>()
+
+        fun showPreferredCopyDialog(gameId: Int) {
+            if (gameId !in preferredCopyDialogVisibleIds) preferredCopyDialogVisibleIds.add(gameId)
+        }
+
+        fun hidePreferredCopyDialog(gameId: Int) {
+            preferredCopyDialogVisibleIds.remove(gameId)
+        }
+
+        fun shouldShowPreferredCopyDialog(gameId: Int): Boolean = gameId in preferredCopyDialogVisibleIds
+
         // Shared state for update/verify operation - map of gameId to AppOptionMenuType
         private val pendingUpdateVerifyOperations = mutableStateMapOf<Int, AppOptionMenuType>()
 
@@ -348,6 +360,32 @@ class SteamAppScreen : BaseAppScreen() {
             gameName = appInfo.name,
         )
 
+        var preferredCopyRefresh by remember(gameId) { mutableIntStateOf(0) }
+        DisposableEffect(gameId) {
+            val listener: (AndroidEvent.PreferredCopyChanged) -> Unit = { event ->
+                if (event.appId == gameId) {
+                    preferredCopyRefresh++
+                }
+            }
+            PluviaApp.events.on<AndroidEvent.PreferredCopyChanged, Unit>(listener)
+            onDispose {
+                PluviaApp.events.off<AndroidEvent.PreferredCopyChanged, Unit>(listener)
+            }
+        }
+
+        val showChangePreferredCopy = remember(gameId, preferredCopyRefresh) {
+            SteamService.hasMultiplePreferredCopyOptions(gameId)
+        }
+        val preferredCopyStatusText = remember(gameId, preferredCopyRefresh, showChangePreferredCopy) {
+            if (!showChangePreferredCopy) return@remember null
+            val active = SteamService.getActivePreferredCopy(gameId) ?: return@remember null
+            if (active.isSelf) {
+                context.getString(R.string.using_your_copy)
+            } else {
+                context.getString(R.string.shared_from_name, active.displayName)
+            }
+        }
+
         return GameDisplayInfo(
             name = appInfo.name,
             developer = appInfo.developer,
@@ -363,7 +401,18 @@ class SteamAppScreen : BaseAppScreen() {
             playtimeText = playtimeText,
             compatibilityMessage = compatibilityMessage,
             compatibilityColor = compatibilityColor,
+            preferredCopyStatusText = preferredCopyStatusText,
+            showChangePreferredCopy = showChangePreferredCopy,
         )
+    }
+
+    override fun onChangePreferredCopyClick(
+        context: Context,
+        libraryItem: LibraryItem,
+    ): (() -> Unit)? {
+        val gameId = libraryItem.gameId
+        if (!SteamService.hasMultiplePreferredCopyOptions(gameId)) return null
+        return { showPreferredCopyDialog(gameId) }
     }
 
     override fun isInstalled(context: Context, libraryItem: LibraryItem): Boolean {
@@ -802,6 +851,16 @@ class SteamAppScreen : BaseAppScreen() {
                     showBranchDialog(gameId)
                 }
             ),
+        )
+
+        if (SteamService.hasMultiplePreferredCopyOptions(gameId)) {
+            options += AppMenuOption(
+                AppOptionMenuType.ChangePreferredCopy,
+                onClick = { showPreferredCopyDialog(gameId) },
+            )
+        }
+
+        options += listOf(
             AppMenuOption(
                 AppOptionMenuType.ForceCloudSync,
                 onClick = {
@@ -1516,6 +1575,37 @@ class SteamAppScreen : BaseAppScreen() {
                 onDismissRequest = { hideBranchDialog(gameId) },
             )
         }
+
+        // Preferred family copy dialog
+        var showPreferredCopyDialogState by remember(gameId) {
+            mutableStateOf(shouldShowPreferredCopyDialog(gameId))
+        }
+        LaunchedEffect(gameId) {
+            snapshotFlow { shouldShowPreferredCopyDialog(gameId) }
+                .collect { showPreferredCopyDialogState = it }
+        }
+
+        if (showPreferredCopyDialogState) {
+            val options = remember(gameId) { SteamService.getPreferredCopyOptions(gameId) }
+            val current = remember(gameId) { SteamService.getActivePreferredCopy(gameId) }
+            val scope = rememberCoroutineScope()
+            SteamPreferredCopyDialog(
+                options = options,
+                currentLenderSteamId = current?.lenderSteamId,
+                onConfirm = { lenderSteamId ->
+                    hidePreferredCopyDialog(gameId)
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) {
+                            SteamService.setPreferredCopy(gameId, lenderSteamId)
+                        }
+                        if (!ok) {
+                            SnackbarManager.show(context.getString(R.string.preferred_copy_failed))
+                        }
+                    }
+                },
+                onDismissRequest = { hidePreferredCopyDialog(gameId) },
+            )
+        }
     }
 }
 
@@ -1630,6 +1720,104 @@ private fun SteamChangeBranchDialog(
                 onClick = { onConfirm(selectedBranch) },
             ) {
                 Text(stringResource(R.string.install))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(stringResource(R.string.cancel))
+            }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SteamPreferredCopyDialog(
+    options: List<app.gamenative.data.PreferredCopyOption>,
+    currentLenderSteamId: Long?,
+    onConfirm: (lenderSteamId: Long) -> Unit,
+    onDismissRequest: () -> Unit,
+) {
+    var selectedSteamId by remember {
+        mutableStateOf(currentLenderSteamId ?: options.firstOrNull()?.lenderSteamId)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        title = { Text(stringResource(R.string.change_preferred_copy)) },
+        text = {
+            var expanded by remember { mutableStateOf(false) }
+            val selectedOption = options.firstOrNull { it.lenderSteamId == selectedSteamId }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    text = stringResource(R.string.change_preferred_copy_message),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = it },
+                ) {
+                    val label = selectedOption?.let { option ->
+                        val base = if (option.isSelf) {
+                            stringResource(R.string.preferred_copy_your_label, option.displayName)
+                        } else {
+                            stringResource(R.string.preferred_copy_family_label, option.displayName)
+                        }
+                        if (option.ownedDlcCount != null) {
+                            "$base · ${stringResource(R.string.preferred_copy_dlc_count, option.ownedDlcCount)}"
+                        } else {
+                            base
+                        }
+                    }.orEmpty()
+                    NoExtractOutlinedTextField(
+                        value = label,
+                        onValueChange = {},
+                        readOnly = true,
+                        singleLine = true,
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false },
+                    ) {
+                        options.forEach { option ->
+                            val itemLabel = if (option.isSelf) {
+                                stringResource(R.string.preferred_copy_your_label, option.displayName)
+                            } else {
+                                stringResource(R.string.preferred_copy_family_label, option.displayName)
+                            }
+                            val withDlc = if (option.ownedDlcCount != null) {
+                                "$itemLabel · ${stringResource(R.string.preferred_copy_dlc_count, option.ownedDlcCount)}"
+                            } else {
+                                itemLabel
+                            }
+                            DropdownMenuItem(
+                                text = { Text(withDlc) },
+                                onClick = {
+                                    selectedSteamId = option.lenderSteamId
+                                    expanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = selectedSteamId != null && selectedSteamId != currentLenderSteamId,
+                onClick = { selectedSteamId?.let(onConfirm) },
+            ) {
+                Text(stringResource(R.string.preferred_copy_confirm))
             }
         },
         dismissButton = {

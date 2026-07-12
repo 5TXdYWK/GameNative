@@ -27,6 +27,7 @@ import app.gamenative.data.GameSource
 import app.gamenative.data.LaunchInfo
 import app.gamenative.data.OwnedGames
 import app.gamenative.data.PostSyncInfo
+import app.gamenative.data.PreferredCopyOption
 import app.gamenative.data.SteamApp
 import app.gamenative.data.SteamControllerConfigDetail
 import app.gamenative.data.SteamFriend
@@ -67,11 +68,13 @@ import `in`.dragonbra.javasteam.depotdownloader.DepotDownloader
 import `in`.dragonbra.javasteam.depotdownloader.IDownloadListener
 import `in`.dragonbra.javasteam.depotdownloader.data.AppItem
 import `in`.dragonbra.javasteam.depotdownloader.data.DownloadItem
+import `in`.dragonbra.javasteam.enums.EAccountType
 import `in`.dragonbra.javasteam.enums.EDepotFileFlag
 import `in`.dragonbra.javasteam.enums.ELicenseFlags
 import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EPersonaState
 import `in`.dragonbra.javasteam.enums.EResult
+import `in`.dragonbra.javasteam.enums.EUniverse
 import `in`.dragonbra.javasteam.networking.steam3.ProtocolTypes
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesClientObjects.ECloudPendingRemoteOperation
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesFamilygroupsSteamclient
@@ -279,6 +282,13 @@ class SteamService : Service(), IChallengeUrlChanged {
 
     // The current shared family group the logged in user is joined to.
     private var familyGroupMembers: ArrayList<Int> = arrayListOf()
+    private var familyGroupId: Long = 0L
+    /** appId → distinct owner steamId64s from GetSharedLibraryApps */
+    private val familyAppOwnerSteamIds: ConcurrentHashMap<Int, List<Long>> = ConcurrentHashMap()
+    /** appId → preferred lender steamId64 from GetPreferredLenders / user choice */
+    private val preferredLenderByAppId: ConcurrentHashMap<Int, Long> = ConcurrentHashMap()
+    /** steamId64 → display name for family members when known */
+    private val familyMemberNames: ConcurrentHashMap<Long, String> = ConcurrentHashMap()
 
     private val appTokens: ConcurrentHashMap<Int, Long> = ConcurrentHashMap()
 
@@ -532,6 +542,172 @@ class SteamService : Service(), IChallengeUrlChanged {
 
         val familyMembers: List<Int>
             get() = instance?.familyGroupMembers ?: emptyList()
+
+        val familyGroupId: Long
+            get() = instance?.familyGroupId ?: 0L
+
+        fun hasMultiplePreferredCopyOptions(appId: Int): Boolean =
+            getPreferredCopyOptions(appId).size >= 2
+
+        fun getPreferredCopyOptions(appId: Int): List<PreferredCopyOption> {
+            val svc = instance ?: return emptyList()
+            val selfSteamId = userSteamId?.convertToUInt64() ?: return emptyList()
+            val selfAccountId = userSteamId!!.accountID.toInt()
+
+            val ownerSteamIds = linkedSetOf<Long>()
+            svc.familyAppOwnerSteamIds[appId]?.let { ownerSteamIds.addAll(it) }
+
+            // Also include owners from local licenses that grant this app.
+            val licenses = runBlocking(Dispatchers.IO) {
+                svc.licenseDao.getAllLicenses().filter { appId in it.appIds }
+            }
+            for (license in licenses) {
+                for (accountId in license.ownerAccountId) {
+                    ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
+                }
+            }
+
+            if (ownerSteamIds.isEmpty()) {
+                // Fallback: active package owners
+                getAppInfoOf(appId)?.ownerAccountId?.forEach { accountId ->
+                    ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
+                }
+            }
+
+            if (ownerSteamIds.isEmpty()) return emptyList()
+
+            return ownerSteamIds.map { steamId64 ->
+                val steamId = SteamID(steamId64)
+                val accountId = steamId.accountID.toInt()
+                val isSelf = steamId64 == selfSteamId || accountId == selfAccountId
+                val packageId = runBlocking(Dispatchers.IO) {
+                    findLicenseForLender(appId, accountId)?.packageId
+                }
+                val dlcCount = if (packageId != null) {
+                    runBlocking(Dispatchers.IO) {
+                        countDlcForLender(appId, accountId)
+                    }
+                } else {
+                    null
+                }
+                PreferredCopyOption(
+                    lenderSteamId = steamId64,
+                    accountId = accountId,
+                    displayName = if (isSelf) {
+                        PrefManager.steamUserName.ifBlank { "Your copy" }
+                    } else {
+                        svc.familyMemberNames[steamId64]
+                            ?: "Family member"
+                    },
+                    isSelf = isSelf,
+                    packageId = packageId,
+                    ownedDlcCount = dlcCount,
+                )
+            }.sortedWith(compareByDescending<PreferredCopyOption> { it.isSelf }.thenBy { it.displayName })
+        }
+
+        fun getActivePreferredCopy(appId: Int): PreferredCopyOption? {
+            val options = getPreferredCopyOptions(appId)
+            if (options.isEmpty()) return null
+            val preferredSteamId = instance?.preferredLenderByAppId?.get(appId)
+                ?: PrefManager.preferredFamilyLenders[appId]
+            if (preferredSteamId != null) {
+                options.firstOrNull { it.lenderSteamId == preferredSteamId }?.let { return it }
+            }
+            val self = options.firstOrNull { it.isSelf }
+            if (self != null) return self
+            return options.first()
+        }
+
+        suspend fun setPreferredCopy(appId: Int, lenderSteamId: Long): Boolean = withContext(Dispatchers.IO) {
+            val svc = instance ?: return@withContext false
+            val groupId = svc.familyGroupId
+            if (groupId == 0L) {
+                Timber.w("setPreferredCopy: no family group")
+                return@withContext false
+            }
+            val familyGroups = svc._steamFamilyGroups ?: return@withContext false
+
+            val request = SteammessagesFamilygroupsSteamclient.CFamilyGroups_SetPreferredLender_Request.newBuilder().apply {
+                familyGroupid = groupId
+                this.appid = appId
+                this.lenderSteamid = lenderSteamId
+            }.build()
+
+            val result = try {
+                familyGroups.setPreferredLender(request).await()
+            } catch (e: Exception) {
+                Timber.e(e, "setPreferredLender failed for appId=$appId")
+                return@withContext false
+            }
+
+            if (result.result != EResult.OK) {
+                Timber.w("setPreferredLender returned ${result.result} for appId=$appId")
+                return@withContext false
+            }
+
+            svc.preferredLenderByAppId[appId] = lenderSteamId
+            PrefManager.setPreferredFamilyLender(appId, lenderSteamId)
+            applyPreferredLenderLocally(appId, lenderSteamId)
+            PluviaApp.events.emit(AndroidEvent.PreferredCopyChanged(appId))
+            true
+        }
+
+        private suspend fun findLicenseForLender(appId: Int, lenderAccountId: Int): SteamLicense? {
+            val svc = instance ?: return null
+            val licenses = svc.licenseDao.getAllLicenses().filter { appId in it.appIds && lenderAccountId in it.ownerAccountId }
+            if (licenses.isEmpty()) return null
+            return licenses.maxByOrNull { license ->
+                when {
+                    ELicenseFlags.Expired in license.licenseFlags -> 0
+                    else -> 1
+                }
+            }
+        }
+
+        private suspend fun countDlcForLender(appId: Int, lenderAccountId: Int): Int {
+            val svc = instance ?: return 0
+            val licenses = svc.licenseDao.getAllLicenses().filter { lenderAccountId in it.ownerAccountId }
+            val dlcApps = svc.appDao.findDownloadableDLCApps(appId).orEmpty() +
+                svc.appDao.findHiddenDLCApps(appId).orEmpty()
+            return dlcApps.count { dlc ->
+                licenses.any { dlc.id in it.appIds }
+            }
+        }
+
+        private suspend fun applyPreferredLenderLocally(appId: Int, lenderSteamId: Long) {
+            val svc = instance ?: return
+            val lenderAccountId = SteamID(lenderSteamId).accountID.toInt()
+            val license = findLicenseForLender(appId, lenderAccountId)
+            val app = svc.appDao.findApp(appId) ?: return
+            if (license != null) {
+                svc.appDao.update(
+                    app.copy(
+                        packageId = license.packageId,
+                        ownerAccountId = listOf(lenderAccountId),
+                        licenseFlags = license.licenseFlags,
+                    ),
+                )
+                Timber.i(
+                    "Applied preferred lender $lenderAccountId for app $appId → package ${license.packageId}",
+                )
+            } else {
+                // Still flip owner for badge / play session even if package row is missing.
+                svc.appDao.update(app.copy(ownerAccountId = listOf(lenderAccountId)))
+                Timber.w(
+                    "Preferred lender $lenderAccountId for app $appId has no local license; ownerAccountId updated only",
+                )
+            }
+        }
+
+        private suspend fun applyAllCachedPreferredLenders() {
+            val svc = instance ?: return
+            val preferred = PrefManager.preferredFamilyLenders.toMutableMap()
+            preferred.putAll(svc.preferredLenderByAppId)
+            for ((appId, lenderSteamId) in preferred) {
+                applyPreferredLenderLocally(appId, lenderSteamId)
+            }
+        }
 
         val isLoginInProgress: Boolean
             get() = instance?._loginResult == LoginResult.InProgress
@@ -2330,14 +2506,20 @@ class SteamService : Service(), IChallengeUrlChanged {
                                         ?: 0
 
                                     val userAccountId = userSteamId!!.accountID.toInt()
+                                    val preferredLender = instance?.preferredLenderByAppId?.get(gameProcess.appId)
+                                        ?: PrefManager.preferredFamilyLenders[gameProcess.appId]
+                                    val preferredAccountId = preferredLender?.let { SteamID(it).accountID.toInt() }
+                                    val ownerId = when {
+                                        preferredAccountId != null &&
+                                            pkgInfo.ownerAccountId.contains(preferredAccountId) -> preferredAccountId
+                                        pkgInfo.ownerAccountId.contains(userAccountId) -> userAccountId
+                                        pkgInfo.ownerAccountId.isNotEmpty() -> pkgInfo.ownerAccountId.first()
+                                        else -> userAccountId
+                                    }
                                     GamePlayedInfo(
                                         gameId = gameProcess.appId.toLong(),
                                         processId = processId,
-                                        ownerId = if (pkgInfo.ownerAccountId.contains(userAccountId)) {
-                                            userAccountId
-                                        } else {
-                                            pkgInfo.ownerAccountId.first()
-                                        },
+                                        ownerId = ownerId,
                                         // TODO: figure out what this is and un-hardcode
                                         launchSource = 100,
                                         gameBuildId = branch.buildId.toInt(),
@@ -3717,6 +3899,87 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
     }
 
+    private suspend fun refreshFamilyPreferredCopyData() {
+        val familyGroups = _steamFamilyGroups ?: return
+        if (familyGroupId == 0L) return
+
+        try {
+            val sharedRequest = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetSharedLibraryApps_Request.newBuilder().apply {
+                familyGroupid = familyGroupId
+                includeOwn = true
+                includeExcluded = false
+                includeNonGames = false
+            }.build()
+
+            val sharedResult = familyGroups.getSharedLibraryApps(sharedRequest).await()
+            if (sharedResult.result == EResult.OK) {
+                familyAppOwnerSteamIds.clear()
+                sharedResult.body.appsList.forEach { sharedApp ->
+                    if (sharedApp.ownerSteamidsCount >= 1) {
+                        familyAppOwnerSteamIds[sharedApp.appid] = sharedApp.ownerSteamidsList.toList()
+                    }
+                }
+                Timber.i("Cached shared library owners for ${familyAppOwnerSteamIds.size} apps")
+            } else {
+                Timber.w("GetSharedLibraryApps failed: ${sharedResult.result}")
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "GetSharedLibraryApps failed")
+        }
+
+        try {
+            val preferredRequest = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetPreferredLenders_Request.newBuilder().apply {
+                familyGroupid = familyGroupId
+            }.build()
+
+            val preferredResult = familyGroups.getPreferredLenders(preferredRequest).await()
+            if (preferredResult.result == EResult.OK) {
+                preferredLenderByAppId.clear()
+                preferredResult.body.membersList.forEach { member ->
+                    val lenderSteamId = member.steamid
+                    member.preferredAppidsList.forEach { appId ->
+                        preferredLenderByAppId[appId] = lenderSteamId
+                    }
+                }
+                // Overlay locally persisted preferences (user may have set while offline to Steam's cache).
+                PrefManager.preferredFamilyLenders.forEach { (appId, lender) ->
+                    preferredLenderByAppId[appId] = lender
+                }
+                Timber.i("Cached ${preferredLenderByAppId.size} preferred family lenders")
+            } else {
+                Timber.w("GetPreferredLenders failed: ${preferredResult.result}")
+                PrefManager.preferredFamilyLenders.forEach { (appId, lender) ->
+                    preferredLenderByAppId[appId] = lender
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "GetPreferredLenders failed")
+            PrefManager.preferredFamilyLenders.forEach { (appId, lender) ->
+                preferredLenderByAppId[appId] = lender
+            }
+        }
+
+        // Best-effort persona names for family members who are also friends.
+        try {
+            val friendIds = familyGroupMembers.map { accountId ->
+                SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual)
+            }
+            if (friendIds.isNotEmpty()) {
+                _steamFriends?.requestFriendInfo(friendIds)
+            }
+            friendIds.forEach { steamId ->
+                val persona = _steamFriends?.getFriendPersonaName(steamId)
+                if (!persona.isNullOrBlank() && persona != "[unknown]") {
+                    familyMemberNames[steamId.convertToUInt64()] = persona
+                }
+            }
+        } catch (e: Exception) {
+            Timber.d(e, "Could not resolve family member persona names")
+        }
+
+        applyAllCachedPreferredLenders()
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
     private fun onLoggedOn(callback: LoggedOnCallback) {
         Timber.i("Logged onto Steam: ${callback.result}")
@@ -3752,6 +4015,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                 // Request family share info if we have a familyGroupId.
                 if (callback.familyGroupId != 0L) {
                     scope.launch {
+                        familyGroupId = callback.familyGroupId
                         val request = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetFamilyGroup_Request.newBuilder().apply {
                             familyGroupid = callback.familyGroupId
                         }.build()
@@ -3766,12 +4030,23 @@ class SteamService : Service(), IChallengeUrlChanged {
 
                             Timber.i("Found family share: ${response.name}, with ${response.membersCount} members.")
 
+                            familyGroupMembers.clear()
                             response.membersList.forEach { member ->
-                                val accountID = SteamID(member.steamid).accountID.toInt()
+                                val steamId = SteamID(member.steamid)
+                                val accountID = steamId.accountID.toInt()
                                 familyGroupMembers.add(accountID)
+                                familyMemberNames[member.steamid] = "Family member"
                             }
                         }
+
+                        refreshFamilyPreferredCopyData()
                     }
+                } else {
+                    familyGroupId = 0L
+                    familyGroupMembers.clear()
+                    familyAppOwnerSteamIds.clear()
+                    preferredLenderByAppId.clear()
+                    familyMemberNames.clear()
                 }
 
                 picsChangesCheckerJob = continuousPICSChangesChecker()
@@ -4009,6 +4284,11 @@ class SteamService : Service(), IChallengeUrlChanged {
             return
         }
 
+        val friendSteamId64 = callback.friendId.convertToUInt64()
+        if (familyGroupMembers.contains(callback.friendId.accountID.toInt())) {
+            familyMemberNames[friendSteamId64] = callback.playerName
+        }
+
         // Timber.d("Persona state received: ${callback.name}")
 
         scope.launch {
@@ -4131,6 +4411,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                         Timber.d("onLicenseList: Queueing ${chunk.size} package(s) for PICS")
                         packagePicsChannel.send(chunk)
                     }
+            }
+
+            // After licenses land, re-apply any preferred family lenders.
+            if (familyGroupId != 0L && preferredLenderByAppId.isNotEmpty()) {
+                applyAllCachedPreferredLenders()
+            } else if (familyGroupId != 0L && PrefManager.preferredFamilyLenders.isNotEmpty()) {
+                PrefManager.preferredFamilyLenders.forEach { (appId, lender) ->
+                    preferredLenderByAppId[appId] = lender
+                }
+                applyAllCachedPreferredLenders()
             }
         }
     }
@@ -4364,13 +4654,29 @@ class SteamService : Service(), IChallengeUrlChanged {
                             }
 
                             // Prefer non-expired user-owned packages so a live sub wins over an expired remnant.
-                            fun pkgRank(pkgId: Int): Int {
+                            // When a preferred family lender is set for an app, prefer that lender's packages higher.
+                            fun preferredLenderAccountForApp(appId: Int): Int? {
+                                val lenderSteamId = preferredLenderByAppId[appId]
+                                    ?: PrefManager.preferredFamilyLenders[appId]
+                                    ?: return null
+                                return SteamID(lenderSteamId).accountID.toInt()
+                            }
+
+                            fun pkgRank(pkgId: Int, forAppId: Int? = null): Int {
+                                val preferredAccount = forAppId?.let { preferredLenderAccountForApp(it) }
+                                val license = packageLicenses[pkgId]
+                                if (preferredAccount != null && license?.ownerAccountId?.contains(preferredAccount) == true) {
+                                    return if (ELicenseFlags.Expired in license.licenseFlags) 3 else 4
+                                }
                                 if (pkgId !in userOwnedPackageIds) return 0
-                                val expired = packageLicenses[pkgId]?.licenseFlags?.contains(ELicenseFlags.Expired) == true
+                                val expired = license?.licenseFlags?.contains(ELicenseFlags.Expired) == true
                                 return if (expired) 1 else 2
                             }
 
-                            val orderedPackages = picsCallback.packages.values.sortedBy { pkgRank(it.id) }
+                            val orderedPackages = picsCallback.packages.values.sortedBy { pkg ->
+                                val appIds = pkg.keyValues["appids"].children.map { it.asInteger() }
+                                appIds.maxOfOrNull { pkgRank(pkg.id, it) } ?: pkgRank(pkg.id)
+                            }
 
                             orderedPackages.forEach { pkg ->
                                 val appIds = pkg.keyValues["appids"].children.map { it.asInteger() }
@@ -4392,13 +4698,18 @@ class SteamService : Service(), IChallengeUrlChanged {
                                     if (accountId != null && existing.packageId != INVALID_PKG_ID) {
                                         val existingLicense = packageLicenses[existing.packageId]
                                             ?: licenseDao.findLicense(existing.packageId)
+                                        val preferredAccount = preferredLenderAccountForApp(appid)
                                         val existingRank = when {
+                                            preferredAccount != null &&
+                                                existingLicense?.ownerAccountId?.contains(preferredAccount) == true -> {
+                                                if (ELicenseFlags.Expired in existingLicense.licenseFlags) 3 else 4
+                                            }
                                             existingLicense == null -> 0
                                             !existingLicense.ownerAccountId.contains(accountId) -> 0
                                             ELicenseFlags.Expired in existingLicense.licenseFlags -> 1
                                             else -> 2
                                         }
-                                        if (existingRank > pkgRank(pkg.id)) {
+                                        if (existingRank > pkgRank(pkg.id, appid)) {
                                             return@forEach
                                         }
                                     }

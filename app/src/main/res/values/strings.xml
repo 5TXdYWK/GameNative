@@ -82,6 +82,7 @@
     <string name="change_branch_message">Download alternate game versions from Steam using developer-provided branches. Enter access codes to unlock private branches.</string>
     <string name="change_preferred_copy">Change preferred copy</string>
     <string name="change_preferred_copy_message">Choose which Steam Family member\'s copy to play. Use a family member\'s copy to access their DLC.</string>
+    <string name="loading_preferred_copy">Checking Family library copies…</string>
     <string name="using_your_copy">Using your copy</string>
     <string name="shared_from_name">Shared from %1$s</string>
     <string name="preferred_copy_your_label">Your copy (%1$s)</string>

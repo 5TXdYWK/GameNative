@@ -158,6 +158,8 @@ import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import timber.log.Timber
@@ -285,6 +287,22 @@ class SteamService : Service(), IChallengeUrlChanged {
     private var familyGroupId: Long = 0L
     /** appId → distinct owner steamId64s from GetSharedLibraryApps */
     private val familyAppOwnerSteamIds: ConcurrentHashMap<Int, List<Long>> = ConcurrentHashMap()
+    /**
+     * True only after a successful GetSharedLibraryApps with includeNonGames=true
+     * and includeExcluded=true. Games-only / excluded-filtered caches must not be
+     * used for preferred-copy DLC counts (Steam omits DLC unless both flags are set).
+     */
+    @Volatile
+    private var familySharedLibraryReadyForDlcCounts: Boolean = false
+    /** Debug: SharedApp metadata from the last successful GetSharedLibraryApps. */
+    private data class SharedLibraryAppMeta(
+        val appType: Int,
+        val name: String,
+        val excludeReason: Int,
+    )
+    private val familySharedLibraryAppMeta: ConcurrentHashMap<Int, SharedLibraryAppMeta> = ConcurrentHashMap()
+    /** Debug: appIds from shared library whose app_type is DLC (32). */
+    private val familySharedLibraryDlcAppIds: MutableSet<Int> = ConcurrentHashMap.newKeySet()
     /** appId → preferred lender steamId64 from GetPreferredLenders / user choice */
     private val preferredLenderByAppId: ConcurrentHashMap<Int, Long> = ConcurrentHashMap()
     /** steamId64 → display name for family members when known */
@@ -333,6 +351,9 @@ class SteamService : Service(), IChallengeUrlChanged {
         private val PROTOCOL_TYPES = EnumSet.of(ProtocolTypes.WEB_SOCKET)
 
         internal var instance: SteamService? = null
+
+        /** Serializes GetSharedLibraryApps clear+refill so login and modal cannot interleave. */
+        private val familySharedLibraryRefreshMutex = Mutex()
 
         var cachedAchievements: List<app.gamenative.statsgen.Achievement>? = null
             private set
@@ -551,74 +572,520 @@ class SteamService : Service(), IChallengeUrlChanged {
 
         suspend fun getPreferredCopyOptions(appId: Int): List<PreferredCopyOption> = withContext(Dispatchers.IO) {
             val svc = instance ?: return@withContext emptyList()
+            // Preferred-copy UI only applies in a Steam Family; skip the expensive license scan otherwise.
+            if (svc.familyGroupId == 0L) return@withContext emptyList()
             val selfId = userSteamId ?: return@withContext emptyList()
             val selfSteamId = selfId.convertToUInt64()
             val selfAccountId = selfId.accountID.toInt()
 
             val ownerSteamIds = linkedSetOf<Long>()
             val cachedOwners = svc.familyAppOwnerSteamIds[appId]
-            if (!cachedOwners.isNullOrEmpty()) {
-                ownerSteamIds.addAll(cachedOwners)
+            val ownerSource = when {
+                !cachedOwners.isNullOrEmpty() -> {
+                    ownerSteamIds.addAll(cachedOwners)
+                    "sharedLibrary"
+                }
+                else -> null
             }
 
-            // Load licenses once; reuse for owner discovery (fallback), package lookup, and DLC counts.
+            // Load licenses once; reuse for owner discovery (fallback) and package lookup.
             val allLicenses = svc.licenseDao.getAllLicenses()
             val licensesForApp = allLicenses.filter { appId in it.appIds }
-            if (ownerSteamIds.isEmpty()) {
+            val resolvedOwnerSource = if (ownerSource == null && licensesForApp.isNotEmpty()) {
                 for (license in licensesForApp) {
                     for (accountId in license.ownerAccountId) {
                         ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
                     }
                 }
+                "licenses"
+            } else {
+                ownerSource
+            }
+
+            val finalOwnerSource = if (ownerSteamIds.isEmpty()) {
+                // Fallback: active package owners (already on IO; avoid nested runBlocking via getAppInfoOf)
+                svc.appDao.findApp(appId)?.ownerAccountId?.forEach { accountId ->
+                    ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
+                }
+                if (ownerSteamIds.isNotEmpty()) "appOwnerAccountId" else "none"
+            } else {
+                resolvedOwnerSource ?: "unknown"
             }
 
             if (ownerSteamIds.isEmpty()) {
-                // Fallback: active package owners
-                getAppInfoOf(appId)?.ownerAccountId?.forEach { accountId ->
-                    ownerSteamIds.add(SteamID(accountId.toLong(), EUniverse.Public, EAccountType.Individual).convertToUInt64())
-                }
+                Timber.d(
+                    "getPreferredCopyOptions appId=$appId owners=0 source=$finalOwnerSource " +
+                        "sharedCached=${cachedOwners?.size ?: 0} licensesForApp=${licensesForApp.size}",
+                )
+                return@withContext emptyList()
             }
 
-            if (ownerSteamIds.isEmpty()) return@withContext emptyList()
+            // DLC counts stay null here; the preferred-copy modal always runs
+            // ensurePreferredCopyDlcCounts before treating counts as final.
+            val selfDisplayName = PrefManager.steamUserName
 
-            val dlcApps = svc.appDao.findDownloadableDLCApps(appId).orEmpty() +
-                svc.appDao.findHiddenDLCApps(appId).orEmpty()
-
-            ownerSteamIds.map { steamId64 ->
+            val options = ownerSteamIds.map { steamId64 ->
                 val steamId = SteamID(steamId64)
                 val accountId = steamId.accountID.toInt()
                 val isSelf = steamId64 == selfSteamId || accountId == selfAccountId
                 val packageId = findLicenseForLender(licensesForApp, accountId)?.packageId
-                val dlcCount = if (packageId != null) {
-                    countDlcForLender(allLicenses, accountId, dlcApps)
-                } else {
-                    null
-                }
                 PreferredCopyOption(
                     lenderSteamId = steamId64,
                     accountId = accountId,
                     displayName = if (isSelf) {
-                        PrefManager.steamUserName
+                        selfDisplayName
                     } else {
                         svc.familyMemberNames[steamId64].orEmpty()
                     },
                     isSelf = isSelf,
                     packageId = packageId,
-                    ownedDlcCount = dlcCount,
+                    ownedDlcCount = null,
                 )
             }.sortedWith(compareByDescending<PreferredCopyOption> { it.isSelf }.thenBy { it.displayName })
+
+            Timber.d(
+                "getPreferredCopyOptions appId=$appId source=$finalOwnerSource " +
+                    "owners=${options.map { "${it.accountId}(self=${it.isSelf},pkg=${it.packageId},name=${it.displayName})" }} " +
+                    "sharedCachedOwners=${cachedOwners.orEmpty()} licensesForApp=${licensesForApp.size}",
+            )
+            options
+        }
+
+        /**
+         * Resolves the parent game's DLC ID catalog (local + PICS), refreshes Family
+         * shared-library owners including non-games and excluded apps (DLC), ensures
+         * lender package license appIds are filled (viaLicense readiness), then fills
+         * per-lender counts from shared-library owners union local licenses.
+         * Always refreshes; callers should show a loading state until this returns.
+         * Leaves [PreferredCopyOption.ownedDlcCount] null only when the catalog is empty
+         * or neither ownership source is usable.
+         */
+        suspend fun ensurePreferredCopyDlcCounts(
+            appId: Int,
+            options: List<PreferredCopyOption>,
+        ): List<PreferredCopyOption> = withContext(Dispatchers.IO) {
+            if (options.isEmpty()) return@withContext options
+            val svc = instance ?: return@withContext options.map { it.copy(ownedDlcCount = null) }
+            val dlcIds = resolveDlcIdsForApp(appId, allowNetwork = true)
+            if (dlcIds.isEmpty()) {
+                Timber.i("ensurePreferredCopyDlcCounts appId=$appId dlcIds=0 (catalog empty)")
+                return@withContext options.map { it.copy(ownedDlcCount = null) }
+            }
+
+            // Steam omits DLC from GetSharedLibraryApps unless includeExcluded=true
+            // (e.g. AppExcluded_NonrefundableDLC). includeNonGames alone is not enough.
+            val refresh = refreshFamilySharedLibraryOwners(
+                includeNonGames = true,
+                includeExcluded = true,
+            )
+            val familyOwners = refresh.owners
+            val sharedReady = refresh.freshSuccess || svc.familySharedLibraryReadyForDlcCounts
+
+            // viaLicense depends on package PICS having filled SteamLicense.appIds.
+            // That queue races the preferred-copy modal; fill empty lender packages
+            // synchronously before treating counts as final (keeps the UI spinner up).
+            val lenderAccountIds = options.mapTo(HashSet()) { it.accountId }
+            val packagesFilled = ensureLenderPackageAppIdsReady(lenderAccountIds)
+
+            val allLicenses = svc.licenseDao.getAllLicenses()
+            val anyLenderHasLicenses = options.any { option ->
+                allLicenses.any { option.accountId in it.ownerAccountId }
+            }
+            if (!sharedReady && !anyLenderHasLicenses) {
+                Timber.i(
+                    "ensurePreferredCopyDlcCounts appId=$appId dlcIds=${dlcIds.size} " +
+                        "freshSuccess=${refresh.freshSuccess} sharedReady=false noLicenses " +
+                        "packagesFilled=$packagesFilled",
+                )
+                return@withContext options.map { it.copy(ownedDlcCount = null) }
+            }
+
+            val sharedOwnersForGame = familyOwners[appId].orEmpty()
+            val sharedDlcHits = dlcIds.count { familyOwners.containsKey(it) }
+            val licenseDlcHits = dlcIds.count { dlcId ->
+                allLicenses.any { dlcId in it.appIds }
+            }
+            val missingFromShared = dlcIds.filterNot { familyOwners.containsKey(it) }
+            val catalogInShared = dlcIds.filter { familyOwners.containsKey(it) }
+
+            Timber.d(
+                "ensurePreferredCopyDlcCounts DETAIL appId=$appId " +
+                    "baseGameSharedOwners=$sharedOwnersForGame " +
+                    "catalogDlcIds=$dlcIds " +
+                    "catalogInShared=$catalogInShared " +
+                    "missingFromShared=$missingFromShared " +
+                    "sharedLibrarySize=${familyOwners.size} " +
+                    "sharedDlcTypeCount=${svc.familySharedLibraryDlcAppIds.size} " +
+                    "freshSuccess=${refresh.freshSuccess} sharedReady=$sharedReady",
+            )
+            dlcIds.forEach { dlcId ->
+                val sharedOwners = familyOwners[dlcId]
+                val licenseOwners = allLicenses
+                    .filter { dlcId in it.appIds }
+                    .flatMap { it.ownerAccountId }
+                    .distinct()
+                val meta = svc.familySharedLibraryAppMeta[dlcId]
+                Timber.d(
+                    "ensurePreferredCopyDlcCounts DLC appId=$appId dlcId=$dlcId " +
+                        "inShared=${sharedOwners != null} sharedOwners=$sharedOwners " +
+                        "licenseOwnerAccounts=$licenseOwners " +
+                        "sharedMeta=${meta?.let {
+                            "type=${it.appType} exclude=${it.excludeReason} name=${it.name}"
+                        } ?: "n/a"}",
+                )
+            }
+
+            val withCounts = options.map { option ->
+                val lenderLicenses = allLicenses.filter { option.accountId in it.ownerAccountId }
+                val viaShared = if (sharedReady) {
+                    dlcIds.filter { familyOwners[it]?.contains(option.lenderSteamId) == true }
+                } else {
+                    emptyList()
+                }
+                val viaLicense = dlcIds.filter { dlcId -> lenderLicenses.any { dlcId in it.appIds } }
+                val count = (viaShared.toSet() + viaLicense.toSet()).size
+                Timber.d(
+                    "ensurePreferredCopyDlcCounts LENDER appId=$appId " +
+                        "accountId=${option.accountId} name=${option.displayName} self=${option.isSelf} " +
+                        "viaShared=$viaShared viaLicense=$viaLicense count=$count " +
+                        "lenderLicenseCount=${lenderLicenses.size}",
+                )
+                option.copy(ownedDlcCount = count)
+            }
+            Timber.i(
+                "ensurePreferredCopyDlcCounts appId=$appId dlcIds=${dlcIds.size} " +
+                    "sharedDlcHits=$sharedDlcHits licenseDlcHits=$licenseDlcHits " +
+                    "packagesFilled=$packagesFilled " +
+                    "freshSuccess=${refresh.freshSuccess} sharedReady=$sharedReady " +
+                    "counts=${withCounts.map { "${it.accountId}:${it.ownedDlcCount}" }}",
+            )
+            withCounts
+        }
+
+        /**
+         * Ensures [SteamLicense.appIds] are populated for packages owned by [lenderAccountIds].
+         * Preferred-copy DLC counts use license appIds; those are normally filled by the
+         * async package PICS queue, which can still be empty when the modal opens.
+         * Returns how many packages were updated in this call.
+         */
+        private suspend fun ensureLenderPackageAppIdsReady(lenderAccountIds: Set<Int>): Int {
+            if (lenderAccountIds.isEmpty()) return 0
+            val svc = instance ?: return 0
+            val steamApps = svc._steamApps ?: return 0
+            val pending = svc.licenseDao.getAllLicenses().filter { license ->
+                license.appIds.isEmpty() &&
+                    license.ownerAccountId.any { it in lenderAccountIds }
+            }
+            if (pending.isEmpty()) {
+                Timber.d(
+                    "ensureLenderPackageAppIdsReady: no empty appIds for " +
+                        "${lenderAccountIds.size} lenders",
+                )
+                return 0
+            }
+            Timber.i(
+                "ensureLenderPackageAppIdsReady: filling appIds for ${pending.size} packages " +
+                    "(lenders=${lenderAccountIds.size})",
+            )
+            var filled = 0
+            pending.chunked(MAX_PICS_BUFFER).forEach { chunk ->
+                val requests = chunk.map { PICSRequest(it.packageId, it.accessToken) }
+                try {
+                    val callback = steamApps.picsGetProductInfo(
+                        apps = emptyList(),
+                        packages = requests,
+                    ).await()
+                    callback.results.forEach { picsCallback ->
+                        picsCallback.packages.values.forEach { pkg ->
+                            val appIds = pkg.keyValues["appids"].children.map { it.asInteger() }
+                            val depotIds = pkg.keyValues["depotids"].children.map { it.asInteger() }
+                            svc.licenseDao.updateApps(pkg.id, appIds)
+                            svc.licenseDao.updateDepots(pkg.id, depotIds)
+                            // Stub rows so downloadable-DLC queries can see newly revealed apps.
+                            appIds.forEach { appid ->
+                                if (svc.appDao.findApp(appid) == null) {
+                                    svc.appDao.insert(SteamApp(id = appid, packageId = pkg.id))
+                                }
+                            }
+                            filled++
+                        }
+                    }
+                } catch (e: Exception) {
+                    Timber.w(
+                        e,
+                        "ensureLenderPackageAppIdsReady: PICS failed for chunk size=${chunk.size}",
+                    )
+                }
+            }
+            Timber.i("ensureLenderPackageAppIdsReady: updated $filled packages")
+            return filled
+        }
+
+        /**
+         * Collects DLC app IDs for [appId] from local parent metadata and DLC rows.
+         * When [allowNetwork] is true, PICS-fetches the parent (with access token when
+         * available) and merges remote listofdlc / depot DLC ids.
+         */
+        private suspend fun resolveDlcIdsForApp(appId: Int, allowNetwork: Boolean): Set<Int> {
+            val svc = instance ?: return emptySet()
+            val ids = linkedSetOf<Int>()
+            val fromListOfDlc = linkedSetOf<Int>()
+            val fromDepots = linkedSetOf<Int>()
+            val fromParentRows = linkedSetOf<Int>()
+            val fromLicensedRows = linkedSetOf<Int>()
+            val fromPics = linkedSetOf<Int>()
+
+            fun collectFromApp(app: SteamApp?, intoListOfDlc: MutableSet<Int>, intoDepots: MutableSet<Int>) {
+                if (app == null) return
+                app.dlcAppIds.filter { it > 0 && it != INVALID_APP_ID }.forEach {
+                    intoListOfDlc.add(it)
+                    ids.add(it)
+                }
+                app.depots.values.forEach { depot ->
+                    if (depot.dlcAppId != INVALID_APP_ID && depot.dlcAppId > 0) {
+                        intoDepots.add(depot.dlcAppId)
+                        ids.add(depot.dlcAppId)
+                    }
+                }
+            }
+
+            collectFromApp(svc.appDao.findApp(appId), fromListOfDlc, fromDepots)
+            svc.appDao.findDlcAppsForParent(appId).forEach {
+                fromParentRows.add(it.id)
+                ids.add(it.id)
+            }
+            svc.appDao.findDownloadableDLCApps(appId).orEmpty().forEach {
+                fromLicensedRows.add(it.id)
+                ids.add(it.id)
+            }
+            svc.appDao.findHiddenDLCApps(appId).orEmpty().forEach {
+                fromLicensedRows.add(it.id)
+                ids.add(it.id)
+            }
+
+            if (!allowNetwork) {
+                Timber.d(
+                    "resolveDlcIdsForApp appId=$appId allowNetwork=false " +
+                        "listofdlc=$fromListOfDlc depots=$fromDepots parentRows=$fromParentRows " +
+                        "licensedRows=$fromLicensedRows total=$ids",
+                )
+                return ids
+            }
+
+            val steamApps = svc._steamApps ?: return ids
+            try {
+                val accessToken = try {
+                    steamApps.picsGetAccessTokens(
+                        appIds = listOf(appId),
+                        packageIds = emptyList(),
+                    ).await().appTokens[appId] ?: 0L
+                } catch (e: Exception) {
+                    Timber.w(e, "resolveDlcIdsForApp: access token failed for appId=$appId")
+                    0L
+                }
+                Timber.d("resolveDlcIdsForApp appId=$appId picsAccessToken=${accessToken != 0L}")
+                val pics = steamApps.picsGetProductInfo(
+                    apps = listOf(PICSRequest(id = appId, accessToken = accessToken)),
+                    packages = emptyList(),
+                ).await()
+                val remote = pics.results
+                    .firstOrNull()
+                    ?.apps
+                    ?.values
+                    ?.firstOrNull()
+                    ?: run {
+                        Timber.d("resolveDlcIdsForApp appId=$appId PICS returned no app; total=$ids")
+                        return ids
+                    }
+                val generated = remote.keyValues.generateSteamApp()
+                collectFromApp(generated, fromPics, fromDepots)
+
+                // Persist so subsequent opens start with a fuller local catalog.
+                val existing = svc.appDao.findApp(appId)
+                if (existing != null) {
+                    val mergedDlcAppIds = (existing.dlcAppIds + generated.dlcAppIds)
+                        .filter { it > 0 && it != INVALID_APP_ID }
+                        .distinct()
+                    svc.appDao.insert(
+                        existing.copy(
+                            dlcAppIds = mergedDlcAppIds.ifEmpty { existing.dlcAppIds },
+                            depots = if (generated.depots.isNotEmpty()) generated.depots else existing.depots,
+                            receivedPICS = true,
+                            lastChangeNumber = remote.changeNumber,
+                        ),
+                    )
+                } else {
+                    svc.appDao.insert(
+                        generated.copy(
+                            receivedPICS = true,
+                            lastChangeNumber = remote.changeNumber,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                Timber.w(e, "resolveDlcIdsForApp: PICS failed for appId=$appId")
+            }
+            Timber.d(
+                "resolveDlcIdsForApp appId=$appId " +
+                    "listofdlcLocal=$fromListOfDlc picsListofdlc=$fromPics depots=$fromDepots " +
+                    "parentRows=$fromParentRows licensedRows=$fromLicensedRows total=${ids.size} ids=$ids",
+            )
+            return ids
+        }
+
+        private data class SharedLibraryRefreshResult(
+            val owners: Map<Int, List<Long>>,
+            /**
+             * True only when this call received EResult.OK for the requested
+             * includeNonGames / includeExcluded flags.
+             */
+            val freshSuccess: Boolean,
+        )
+
+        /**
+         * Fetches Steam Family shared-library ownership and replaces [familyAppOwnerSteamIds].
+         * Pass [includeNonGames] = true and [includeExcluded] = true for preferred-copy DLC
+         * counts; Steam omits DLC rows unless both are set.
+         * On failure returns the current cache with [SharedLibraryRefreshResult.freshSuccess] false.
+         */
+        private suspend fun refreshFamilySharedLibraryOwners(
+            includeNonGames: Boolean,
+            includeExcluded: Boolean = false,
+        ): SharedLibraryRefreshResult = familySharedLibraryRefreshMutex.withLock {
+            val svc = instance
+                ?: return SharedLibraryRefreshResult(emptyMap(), freshSuccess = false)
+            val familyGroups = svc._steamFamilyGroups
+                ?: return SharedLibraryRefreshResult(
+                    svc.familyAppOwnerSteamIds.toMap(),
+                    freshSuccess = false,
+                )
+            if (svc.familyGroupId == 0L) {
+                return SharedLibraryRefreshResult(emptyMap(), freshSuccess = false)
+            }
+
+            try {
+                val sharedRequest = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetSharedLibraryApps_Request.newBuilder().apply {
+                    familyGroupid = svc.familyGroupId
+                    includeOwn = true
+                    this.includeExcluded = includeExcluded
+                    this.includeNonGames = includeNonGames
+                    // Omit maxApps so Steam uses its default (large Int.MAX_VALUE was speculative).
+                }.build()
+
+                val sharedResult = familyGroups.getSharedLibraryApps(sharedRequest).await()
+                if (sharedResult.result != EResult.OK) {
+                    Timber.w(
+                        "GetSharedLibraryApps(includeNonGames=$includeNonGames " +
+                            "includeExcluded=$includeExcluded) failed: ${sharedResult.result}",
+                    )
+                    return SharedLibraryRefreshResult(
+                        svc.familyAppOwnerSteamIds.toMap(),
+                        freshSuccess = false,
+                    )
+                }
+
+                // Full replace under the mutex so readers never see a half-cleared map from
+                // concurrent login + modal refreshes.
+                val next = ConcurrentHashMap<Int, List<Long>>()
+                val nextMeta = ConcurrentHashMap<Int, SharedLibraryAppMeta>()
+                val nextDlcIds = ConcurrentHashMap.newKeySet<Int>()
+                var appTypeGame = 0
+                var appTypeDlc = 0
+                var appTypeOther = 0
+                val excludeReasonCounts = mutableMapOf<Int, Int>()
+                sharedResult.body.appsList.forEach { sharedApp ->
+                    if (sharedApp.ownerSteamidsCount >= 1) {
+                        next[sharedApp.appid] = sharedApp.ownerSteamidsList.toList()
+                    }
+                    val appType = sharedApp.appType.number
+                    val excludeReason = sharedApp.excludeReason.number
+                    val name = sharedApp.name.orEmpty()
+                    nextMeta[sharedApp.appid] = SharedLibraryAppMeta(
+                        appType = appType,
+                        name = name,
+                        excludeReason = excludeReason,
+                    )
+                    excludeReasonCounts[excludeReason] = (excludeReasonCounts[excludeReason] ?: 0) + 1
+                    when (appType) {
+                        1 -> appTypeGame++
+                        32 -> {
+                            appTypeDlc++
+                            nextDlcIds.add(sharedApp.appid)
+                        }
+                        else -> appTypeOther++
+                    }
+                }
+                svc.familyAppOwnerSteamIds.clear()
+                svc.familyAppOwnerSteamIds.putAll(next)
+                svc.familySharedLibraryAppMeta.clear()
+                svc.familySharedLibraryAppMeta.putAll(nextMeta)
+                svc.familySharedLibraryDlcAppIds.clear()
+                svc.familySharedLibraryDlcAppIds.addAll(nextDlcIds)
+                // Only mark DLC-ready when this successful response requested both flags.
+                svc.familySharedLibraryReadyForDlcCounts = includeNonGames && includeExcluded
+                val excludeHistogram = excludeReasonCounts.entries
+                    .sortedByDescending { it.value }
+                    .take(10)
+                    .joinToString { "${it.key}=${it.value}" }
+                Timber.i(
+                    "Cached shared library owners for ${svc.familyAppOwnerSteamIds.size} apps " +
+                        "(includeNonGames=$includeNonGames includeExcluded=$includeExcluded " +
+                        "game=$appTypeGame dlc=$appTypeDlc other=$appTypeOther " +
+                        "excludeTop=[$excludeHistogram])",
+                )
+                if (nextDlcIds.isNotEmpty()) {
+                    Timber.d(
+                        "GetSharedLibraryApps DLC sample (up to 30): " +
+                            nextDlcIds.take(30).map { id ->
+                                val meta = nextMeta[id]
+                                "$id(type=${meta?.appType},exclude=${meta?.excludeReason}," +
+                                    "name=${meta?.name},owners=${next[id]})"
+                            },
+                    )
+                } else {
+                    Timber.d(
+                        "GetSharedLibraryApps returned 0 app_type=DLC entries " +
+                            "(includeNonGames=$includeNonGames includeExcluded=$includeExcluded " +
+                            "totalApps=${sharedResult.body.appsList.size})",
+                    )
+                }
+                SharedLibraryRefreshResult(
+                    svc.familyAppOwnerSteamIds.toMap(),
+                    freshSuccess = true,
+                )
+            } catch (e: Exception) {
+                Timber.e(
+                    e,
+                    "GetSharedLibraryApps(includeNonGames=$includeNonGames " +
+                        "includeExcluded=$includeExcluded) failed",
+                )
+                SharedLibraryRefreshResult(
+                    svc.familyAppOwnerSteamIds.toMap(),
+                    freshSuccess = false,
+                )
+            }
         }
 
         suspend fun getActivePreferredCopy(appId: Int): PreferredCopyOption? =
             selectActivePreferredCopy(appId, getPreferredCopyOptions(appId))
 
+        /**
+         * Resolves the active preferred copy. Prefers the in-memory lender map; only
+         * falls back to [PrefManager.preferredFamilyLenders] (sync DataStore read) when
+         * that map has not been hydrated yet. Call from a background dispatcher.
+         */
         fun selectActivePreferredCopy(
             appId: Int,
             options: List<PreferredCopyOption>,
         ): PreferredCopyOption? {
             if (options.isEmpty()) return null
-            val preferredSteamId = instance?.preferredLenderByAppId?.get(appId)
-                ?: PrefManager.preferredFamilyLenders[appId]
+            val preferredMap = instance?.preferredLenderByAppId
+            val preferredSteamId = when {
+                preferredMap == null -> PrefManager.preferredFamilyLenders[appId]
+                // Empty map means not yet hydrated from network/prefs; allow PrefManager fallback.
+                preferredMap.isEmpty() -> PrefManager.preferredFamilyLenders[appId]
+                else -> preferredMap[appId]
+            }
             if (preferredSteamId != null) {
                 options.firstOrNull { it.lenderSteamId == preferredSteamId }?.let { return it }
             }
@@ -657,7 +1124,10 @@ class SteamService : Service(), IChallengeUrlChanged {
             svc.preferredLenderByAppId[appId] = lenderSteamId
             PrefManager.setPreferredFamilyLender(appId, lenderSteamId)
             applyPreferredLenderLocally(appId, lenderSteamId)
-            PluviaApp.events.emit(AndroidEvent.PreferredCopyChanged(appId))
+            // Emit on Main so Compose listeners can safely update UI state.
+            withContext(Dispatchers.Main.immediate) {
+                PluviaApp.events.emit(AndroidEvent.PreferredCopyChanged(appId))
+            }
             true
         }
 
@@ -672,17 +1142,6 @@ class SteamService : Service(), IChallengeUrlChanged {
                     ELicenseFlags.Expired in license.licenseFlags -> 0
                     else -> 1
                 }
-            }
-        }
-
-        private fun countDlcForLender(
-            allLicenses: List<SteamLicense>,
-            lenderAccountId: Int,
-            dlcApps: List<SteamApp>,
-        ): Int {
-            val licenses = allLicenses.filter { lenderAccountId in it.ownerAccountId }
-            return dlcApps.count { dlc ->
-                licenses.any { dlc.id in it.appIds }
             }
         }
 
@@ -3916,25 +4375,9 @@ class SteamService : Service(), IChallengeUrlChanged {
         if (familyGroupId == 0L) return
 
         try {
-            val sharedRequest = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetSharedLibraryApps_Request.newBuilder().apply {
-                familyGroupid = familyGroupId
-                includeOwn = true
-                includeExcluded = false
-                includeNonGames = false
-            }.build()
-
-            val sharedResult = familyGroups.getSharedLibraryApps(sharedRequest).await()
-            if (sharedResult.result == EResult.OK) {
-                familyAppOwnerSteamIds.clear()
-                sharedResult.body.appsList.forEach { sharedApp ->
-                    if (sharedApp.ownerSteamidsCount >= 1) {
-                        familyAppOwnerSteamIds[sharedApp.appid] = sharedApp.ownerSteamidsList.toList()
-                    }
-                }
-                Timber.i("Cached shared library owners for ${familyAppOwnerSteamIds.size} apps")
-            } else {
-                Timber.w("GetSharedLibraryApps failed: ${sharedResult.result}")
-            }
+            // Login refresh keeps includeExcluded=false (playable shared games).
+            // Preferred-copy DLC counts re-fetch with includeExcluded=true on demand.
+            refreshFamilySharedLibraryOwners(includeNonGames = true, includeExcluded = false)
         } catch (e: Exception) {
             Timber.e(e, "GetSharedLibraryApps failed")
         }
@@ -4055,6 +4498,9 @@ class SteamService : Service(), IChallengeUrlChanged {
                     familyGroupId = 0L
                     familyGroupMembers.clear()
                     familyAppOwnerSteamIds.clear()
+                    familySharedLibraryReadyForDlcCounts = false
+                    familySharedLibraryAppMeta.clear()
+                    familySharedLibraryDlcAppIds.clear()
                     preferredLenderByAppId.clear()
                     familyMemberNames.clear()
                 }

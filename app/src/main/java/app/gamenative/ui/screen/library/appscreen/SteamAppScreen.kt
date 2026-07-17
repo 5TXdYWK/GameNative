@@ -401,8 +401,10 @@ class SteamAppScreen : BaseAppScreen() {
 
         // Read companion Snapshot map so status recomposes when the change-copy dialog updates it.
         val preferredCopyUi = preferredCopyUiByAppId[gameId]
-        LaunchedEffect(gameId) {
-            if (SteamService.familyGroupId == 0L) {
+        // familyGroupId is set asynchronously on LoggedOn; collect so load restarts when it hydrates.
+        val familyGroupId by SteamService.familyGroupIdFlow.collectAsState()
+        LaunchedEffect(gameId, familyGroupId) {
+            if (familyGroupId == 0L) {
                 setPreferredCopyUi(gameId, PreferredCopyUiState())
                 return@LaunchedEffect
             }
@@ -444,7 +446,7 @@ class SteamAppScreen : BaseAppScreen() {
             preferredCopyStatusText = preferredCopyUi?.statusText,
             showChangePreferredCopy = preferredCopyUi?.showChange == true,
             isLoadingPreferredCopy = preferredCopyUi?.isLoading == true ||
-                (preferredCopyUi == null && SteamService.familyGroupId != 0L),
+                (preferredCopyUi == null && familyGroupId != 0L),
         )
     }
 
@@ -1647,7 +1649,8 @@ class SteamAppScreen : BaseAppScreen() {
             var options by remember(gameId) { mutableStateOf<List<PreferredCopyOption>>(emptyList()) }
             var current by remember(gameId) { mutableStateOf<PreferredCopyOption?>(null) }
             var isLoadingDlcCounts by remember(gameId) { mutableStateOf(true) }
-            val scope = rememberCoroutineScope()
+            // Use AdditionalDialogs' scope (above), not a dialog-branch scope: hidePreferredCopyDialog
+            // leaves this branch and would cancel save/rollback mid-flight after optimistic UI update.
             LaunchedEffect(gameId) {
                 val (loaded, active) = withContext(Dispatchers.IO) {
                     val options = SteamService.getPreferredCopyOptions(gameId)

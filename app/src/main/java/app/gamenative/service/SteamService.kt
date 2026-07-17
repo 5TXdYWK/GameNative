@@ -154,6 +154,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.filter
@@ -289,6 +290,12 @@ class SteamService : Service(), IChallengeUrlChanged {
     // The current shared family group the logged in user is joined to.
     private var familyGroupMembers: ArrayList<Int> = arrayListOf()
     private var familyGroupId: Long = 0L
+
+    private fun setFamilyGroupId(id: Long) {
+        familyGroupId = id
+        _familyGroupIdFlow.value = id
+    }
+
     /** appId → distinct owner steamId64s from GetSharedLibraryApps */
     private val familyAppOwnerSteamIds: ConcurrentHashMap<Int, List<Long>> = ConcurrentHashMap()
     /**
@@ -572,6 +579,10 @@ class SteamService : Service(), IChallengeUrlChanged {
         val familyGroupId: Long
             get() = instance?.familyGroupId ?: 0L
 
+        /** Observable family group id; updates when LoggedOn hydrates (or clears) family sharing. */
+        private val _familyGroupIdFlow = MutableStateFlow(0L)
+        val familyGroupIdFlow: StateFlow<Long> = _familyGroupIdFlow.asStateFlow()
+
         suspend fun hasMultiplePreferredCopyOptions(appId: Int): Boolean =
             getPreferredCopyOptions(appId).size >= 2
 
@@ -693,13 +704,17 @@ class SteamService : Service(), IChallengeUrlChanged {
             val packagesFilled = ensureLenderPackageAppIdsReady(lenderAccountIds)
 
             val allLicenses = svc.licenseDao.getAllLicenses()
-            val anyLenderHasLicenses = options.any { option ->
-                allLicenses.any { option.accountId in it.ownerAccountId }
+            // License fallback only counts when appIds were filled (package PICS). Empty appIds
+            // would otherwise yield a fake "0 DLC" after shared-library refresh failure.
+            val anyLenderHasPopulatedLicenses = options.any { option ->
+                allLicenses.any {
+                    option.accountId in it.ownerAccountId && it.appIds.isNotEmpty()
+                }
             }
-            if (!sharedReady && !anyLenderHasLicenses) {
+            if (!sharedReady && !anyLenderHasPopulatedLicenses) {
                 Timber.i(
                     "ensurePreferredCopyDlcCounts appId=$appId dlcIds=${dlcIds.size} " +
-                        "freshSuccess=${refresh.freshSuccess} sharedReady=false noLicenses " +
+                        "freshSuccess=${refresh.freshSuccess} sharedReady=false noPopulatedLicenses " +
                         "packagesFilled=$packagesFilled",
                 )
                 return@withContext options.map { it.copy(ownedDlcCount = null) }
@@ -806,12 +821,6 @@ class SteamService : Service(), IChallengeUrlChanged {
                             val depotIds = pkg.keyValues["depotids"].children.map { it.asInteger() }
                             svc.licenseDao.updateApps(pkg.id, appIds)
                             svc.licenseDao.updateDepots(pkg.id, depotIds)
-                            // Stub rows so downloadable-DLC queries can see newly revealed apps.
-                            appIds.forEach { appid ->
-                                if (svc.appDao.findApp(appid) == null) {
-                                    svc.appDao.insert(SteamApp(id = appid, packageId = pkg.id))
-                                }
-                            }
                             filled++
                         }
                     }
@@ -855,9 +864,9 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             collectFromApp(svc.appDao.findApp(appId), fromListOfDlc, fromDepots)
-            svc.appDao.findDlcAppsForParent(appId).forEach {
-                fromParentRows.add(it.id)
-                ids.add(it.id)
+            svc.appDao.findDlcAppIdsForParent(appId).forEach {
+                fromParentRows.add(it)
+                ids.add(it)
             }
             svc.appDao.findDownloadableDLCApps(appId).orEmpty().forEach {
                 fromLicensedRows.add(it.id)
@@ -4280,6 +4289,7 @@ class SteamService : Service(), IChallengeUrlChanged {
         isConnected = false
         isLoggingOut = false
         isWaitingForQRAuth = false
+        setFamilyGroupId(0L)
 
         steamClient = null
         _steamUser = null
@@ -4477,9 +4487,10 @@ class SteamService : Service(), IChallengeUrlChanged {
                 steamCollectionsJob = scope.launch { fetchSteamCollections() }
 
                 // Request family share info if we have a familyGroupId.
+                // Set id synchronously so UI can observe hydration before the RPC finishes.
                 if (callback.familyGroupId != 0L) {
+                    setFamilyGroupId(callback.familyGroupId)
                     scope.launch {
-                        familyGroupId = callback.familyGroupId
                         val request = SteammessagesFamilygroupsSteamclient.CFamilyGroups_GetFamilyGroup_Request.newBuilder().apply {
                             familyGroupid = callback.familyGroupId
                         }.build()
@@ -4506,7 +4517,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                         refreshFamilyPreferredCopyData()
                     }
                 } else {
-                    familyGroupId = 0L
+                    setFamilyGroupId(0L)
                     familyGroupMembers.clear()
                     familyAppOwnerSteamIds.clear()
                     familySharedLibraryReadyForDlcCounts = false

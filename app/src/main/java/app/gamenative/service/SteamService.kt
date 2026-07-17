@@ -296,6 +296,10 @@ class SteamService : Service(), IChallengeUrlChanged {
         _familyGroupIdFlow.value = id
     }
 
+    private fun bumpFamilyPreferredCopyDataVersion() {
+        _familyPreferredCopyDataVersion.update { it + 1 }
+    }
+
     /** appId → distinct owner steamId64s from GetSharedLibraryApps */
     private val familyAppOwnerSteamIds: ConcurrentHashMap<Int, List<Long>> = ConcurrentHashMap()
     /**
@@ -582,6 +586,14 @@ class SteamService : Service(), IChallengeUrlChanged {
         /** Observable family group id; updates when LoggedOn hydrates (or clears) family sharing. */
         private val _familyGroupIdFlow = MutableStateFlow(0L)
         val familyGroupIdFlow: StateFlow<Long> = _familyGroupIdFlow.asStateFlow()
+
+        /**
+         * Bumps when family preferred-copy caches finish refreshing (owners, preferred lenders).
+         * [familyGroupIdFlow] alone is not enough: the id is set before those RPCs complete,
+         * and StateFlow will not re-emit an unchanged id when a later refresh fills the caches.
+         */
+        private val _familyPreferredCopyDataVersion = MutableStateFlow(0)
+        val familyPreferredCopyDataVersion: StateFlow<Int> = _familyPreferredCopyDataVersion.asStateFlow()
 
         suspend fun hasMultiplePreferredCopyOptions(appId: Int): Boolean =
             getPreferredCopyOptions(appId).size >= 2
@@ -4290,6 +4302,14 @@ class SteamService : Service(), IChallengeUrlChanged {
         isLoggingOut = false
         isWaitingForQRAuth = false
         setFamilyGroupId(0L)
+        familyGroupMembers.clear()
+        familyAppOwnerSteamIds.clear()
+        familySharedLibraryReadyForDlcCounts = false
+        familySharedLibraryAppMeta.clear()
+        familySharedLibraryDlcAppIds.clear()
+        preferredLenderByAppId.clear()
+        familyMemberNames.clear()
+        bumpFamilyPreferredCopyDataVersion()
 
         steamClient = null
         _steamUser = null
@@ -4449,6 +4469,8 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
 
         applyAllCachedPreferredLenders()
+        // Notify UI after caches are filled; familyGroupId was already set before this RPC.
+        bumpFamilyPreferredCopyDataVersion()
     }
 
     @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
@@ -4525,6 +4547,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                     familySharedLibraryDlcAppIds.clear()
                     preferredLenderByAppId.clear()
                     familyMemberNames.clear()
+                    bumpFamilyPreferredCopyDataVersion()
                 }
 
                 picsChangesCheckerJob = continuousPICSChangesChecker()

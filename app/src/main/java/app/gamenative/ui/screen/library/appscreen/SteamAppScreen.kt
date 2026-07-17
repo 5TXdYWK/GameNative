@@ -401,9 +401,10 @@ class SteamAppScreen : BaseAppScreen() {
 
         // Read companion Snapshot map so status recomposes when the change-copy dialog updates it.
         val preferredCopyUi = preferredCopyUiByAppId[gameId]
-        // familyGroupId is set asynchronously on LoggedOn; collect so load restarts when it hydrates.
+        // familyGroupId flips early on LoggedOn; dataVersion bumps after shared-library refresh.
         val familyGroupId by SteamService.familyGroupIdFlow.collectAsState()
-        LaunchedEffect(gameId, familyGroupId) {
+        val familyPreferredCopyDataVersion by SteamService.familyPreferredCopyDataVersion.collectAsState()
+        LaunchedEffect(gameId, familyGroupId, familyPreferredCopyDataVersion) {
             if (familyGroupId == 0L) {
                 setPreferredCopyUi(gameId, PreferredCopyUiState())
                 return@LaunchedEffect
@@ -804,8 +805,10 @@ class SteamAppScreen : BaseAppScreen() {
         val appInfo = SteamService.getAppInfoOf(gameId) ?: return emptyList()
         val isDownloadInProgress = SteamService.getDownloadingAppInfoOf(gameId) != null
         val scope = rememberCoroutineScope()
+        val familyGroupId by SteamService.familyGroupIdFlow.collectAsState()
+        val familyPreferredCopyDataVersion by SteamService.familyPreferredCopyDataVersion.collectAsState()
         var showPreferredCopyMenuOption by remember(gameId) { mutableStateOf(false) }
-        LaunchedEffect(gameId) {
+        LaunchedEffect(gameId, familyGroupId, familyPreferredCopyDataVersion) {
             showPreferredCopyMenuOption = withContext(Dispatchers.IO) {
                 SteamService.hasMultiplePreferredCopyOptions(gameId)
             }
